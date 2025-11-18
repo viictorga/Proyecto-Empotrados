@@ -1,0 +1,156 @@
+
+```cpp
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+#include <UniversalTelegramBot.h>
+#include "secrets.h"
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// 🧠 Variables globales
+float temperature = 0.0;
+float humidity = 0.0;
+unsigned long lastReadTime = 0;
+const unsigned long readInterval = 2000;
+
+//  Config WiFi
+const char* ssid = "Victor S24";
+const char* password = "Gorjon23";
+
+//  Config Telegram
+#define BOT_TOKEN "7245526733:AAExEEXnTjtndfg_DMQ3X0Drs6v7ivKR-ko"
+#define CHAT_ID "5036043110"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+unsigned long lastAlertTime = 0;
+const unsigned long alertInterval = 60000; // 1 minuto mínimo entre alertas
+
+//  Umbrales
+const float TEMP_THRESHOLD = 30.0;
+const float HUM_THRESHOLD = 40.0;
+
+//  Servidor web
+AsyncWebServer server(80);
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+  Serial.println("Booting up...");
+  Serial.print("SECRETO: ");
+
+  dht.begin();
+  delay(2000);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi conectado");
+  Serial.println(WiFi.localIP());
+
+  client.setInsecure(); // Para evitar problemas con certificados HTTPS
+
+  // Endpoint JSON
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(200);
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // Página web
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Estación Meteorológica ESP32-S3</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body style="font-family: sans-serif; text-align: center;">
+  <h2>🌤 Estación Meteorológica IoT con Telegram</h2>
+  <p>Temperatura: <span id="temp">--</span> °C</p>
+  <p>Humedad: <span id="hum">--</span> %</p>
+  <canvas id="chart" width="400" height="200"></canvas>
+
+  <script>
+    const tempEl = document.getElementById("temp");
+    const humEl = document.getElementById("hum");
+    const ctx = document.getElementById("chart");
+    const data = {
+      labels: [],
+      datasets: [
+        { label: "Temperatura (°C)", data: [], borderColor: "red", fill: false },
+        { label: "Humedad (%)", data: [], borderColor: "blue", fill: false }
+      ]
+    };
+    const chart = new Chart(ctx, { type: "line", data, options: { scales: { y: { beginAtZero: true } } } });
+
+    async function update() {
+      const res = await fetch("/data");
+      const json = await res.json();
+      tempEl.textContent = json.temperature.toFixed(1);
+      humEl.textContent = json.humidity.toFixed(1);
+      const now = new Date().toLocaleTimeString();
+      data.labels.push(now);
+      data.datasets[0].data.push(json.temperature);
+      data.datasets[1].data.push(json.humidity);
+      if (data.labels.length > 20) {
+        data.labels.shift();
+        data.datasets[0].data.shift();
+        data.datasets[1].data.shift();
+      }
+      chart.update();
+    }
+    setInterval(update, 2000);
+  </script>
+</body>
+</html>
+    )rawliteral");
+  });
+
+  server.begin();
+
+  
+}
+
+void loop() {
+  if (millis() - lastReadTime > readInterval) {
+
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    lastReadTime = millis();
+
+    Serial.printf("Temp: %.1f °C, Hum: %.1f %%\n", temperature, humidity);
+
+    // Enviar alerta si es necesario
+    if ((temperature > TEMP_THRESHOLD || humidity < HUM_THRESHOLD) &&
+        (millis() - lastAlertTime > alertInterval)) {
+
+      String message = "⚠ Alerta Estación Meteorológica\n";
+      if (temperature > TEMP_THRESHOLD) {
+        message += "🔥 Temperatura alta: " + String(temperature, 1) + " °C\n";
+      }
+      if (humidity < HUM_THRESHOLD) {
+        message += "💧 Humedad baja: " + String(humidity, 1) + " %\n";
+      }
+
+      bot.sendMessage(CHAT_ID, message, "Markdown");
+      lastAlertTime = millis();
+      Serial.println("📩 Alerta enviada a Telegram");
+    }
+  }
+}
+```
