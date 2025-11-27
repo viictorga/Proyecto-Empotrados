@@ -1,0 +1,201 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+#include <UniversalTelegramBot.h>
+#include <HTTPClient.h>
+#include "secrets.h"
+
+// ----------- CONFIG SENSORES -----------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+float temperature = 0.0;
+float humidity = 0.0;
+
+// ----------- CONFIG OWM -----------
+const char* city = "Madrid,ES";
+const char* apiKey = "27d3ec1f8b83dedf587fe5f9956f37d5";
+
+float ow_tempMin = 0;
+float ow_tempMax = 0;
+int ow_humidity = 0;
+String ow_description = "";
+
+unsigned long lastWeatherCall = 0;
+const unsigned long weatherInterval = 60000;
+
+// ----------- CONFIG WIFI -----------
+const char* ssid = "Victor S24";
+const char* password = "Gorjon23";
+
+// ----------- CONFIG TELEGRAM -----------
+#define BOT_TOKEN "xxxxx"
+#define CHAT_ID "xxxxx"
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+unsigned long lastAlertTime = 0;
+const unsigned long alertInterval = 60000;
+
+// ----------- UMBRALES -----------
+const float TEMP_THRESHOLD = 30.0;
+const float HUM_THRESHOLD = 40.0;
+
+// ----------- SERVIDOR WEB -----------
+AsyncWebServer server(80);
+
+// ==========================
+//     WEATHER API FUNCTION
+// ==========================
+void fetchWeather() {
+  if (millis() - lastWeatherCall < weatherInterval) return;
+  lastWeatherCall = millis();
+
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" +
+               String(city) + "&appid=" + String(apiKey);
+
+  http.begin(url);
+  int code = http.GET();
+
+  if (code > 0) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+
+    if (!deserializeJson(doc, payload)) {
+      float tempMinK = doc["main"]["temp_min"];
+      float tempMaxK = doc["main"]["temp_max"];
+      ow_humidity = doc["main"]["humidity"];
+      ow_description = doc["weather"][0]["description"].as<String>();
+
+      ow_tempMin = tempMinK - 273.15;
+      ow_tempMax = tempMaxK - 273.15;
+
+      Serial.println("=== OpenWeatherMap ===");
+      Serial.printf("Min: %.1f °C\n", ow_tempMin);
+      Serial.printf("Max: %.1f °C\n", ow_tempMax);
+      Serial.printf("Hum: %d %%\n", ow_humidity);
+      Serial.printf("Desc: %s\n", ow_description.c_str());
+      Serial.println("======================");
+    }
+  }
+
+  http.end();
+}
+
+// ==========================
+//            SETUP
+// ==========================
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+
+  dht.begin();
+  WiFi.begin(ssid, password);
+
+  Serial.print("Conectando a WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Conectado!");
+  Serial.println(WiFi.localIP());
+  client.setInsecure();
+
+  // ---- ENDPOINT JSON /data ----
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(400);
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+
+    doc["ow_tempMin"] = ow_tempMin;
+    doc["ow_tempMax"] = ow_tempMax;
+    doc["ow_humidity"] = ow_humidity;
+    doc["ow_description"] = ow_description;
+
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // ---- PAGINA WEB ----
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Estación Meteorológica + OWM</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body style="font-family: sans-serif; text-align: center;">
+  <h2>🌤 Estación IoT con DHT + OpenWeatherMap</h2>
+
+  <h3>Datos del Sensor DHT:</h3>
+  <p>Temperatura: <span id="temp">--</span> °C</p>
+  <p>Humedad: <span id="hum">--</span> %</p>
+
+  <h3>Datos API OpenWeatherMap:</h3>
+  <p>Mínima: <span id="omin">--</span> °C</p>
+  <p>Máxima: <span id="omax">--</span> °C</p>
+  <p>Humedad OWM: <span id="ohum">--</span> %</p>
+  <p>Descripción: <span id="odesc">--</span></p>
+
+  <script>
+    async function update() {
+      const res = await fetch("/data");
+      const json = await res.json();
+
+      document.getElementById("temp").textContent = json.temperature.toFixed(1);
+      document.getElementById("hum").textContent = json.humidity.toFixed(1);
+
+      document.getElementById("omin").textContent = json.ow_tempMin.toFixed(1);
+      document.getElementById("omax").textContent = json.ow_tempMax.toFixed(1);
+      document.getElementById("ohum").textContent = json.ow_humidity;
+      document.getElementById("odesc").textContent = json.ow_description;
+    }
+
+    setInterval(update, 2000);
+  </script>
+
+</body>
+</html>
+    )rawliteral");
+  });
+
+  server.begin();
+}
+
+// ==========================
+//            LOOP
+// ==========================
+void loop() {
+  // Leer sensor DHT
+  static unsigned long lastReadTime = 0;
+  if (millis() - lastReadTime > 2000) {
+    lastReadTime = millis();
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+  }
+
+  // Llamada a OpenWeatherMap
+  fetchWeather();
+
+  // Alertas Telegram
+  if ((temperature > TEMP_THRESHOLD || humidity < HUM_THRESHOLD) &&
+      (millis() - lastAlertTime > alertInterval)) {
+
+    String msg = "⚠ ALERTA DHT11\n";
+    if (temperature > TEMP_THRESHOLD)
+      msg += "🔥 Temperatura alta: " + String(temperature) + "°C\n";
+    if (humidity < HUM_THRESHOLD)
+      msg += "💧 Humedad baja: " + String(humidity) + "%\n";
+
+    bot.sendMessage(CHAT_ID, msg, "");
+    lastAlertTime = millis();
+  }
+}
